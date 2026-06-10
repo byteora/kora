@@ -10,7 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class JsonEnumTest {
 
-    public enum Status implements IEnum<Status, Integer> {
+    public enum Status implements IEnum<Integer> {
         ON(1), OFF(0);
 
         private final int code;
@@ -23,19 +23,9 @@ public class JsonEnumTest {
         public Integer getValue() {
             return code;
         }
-
-        @Override
-        public Status parse(Integer value) {
-            for (Status status : values()) {
-                if (status.code == value) {
-                    return status;
-                }
-            }
-            return null;
-        }
     }
 
-    public enum Level implements IEnum<Level, String> {
+    public enum Level implements IEnum<String> {
         LOW("low"), HIGH("high");
 
         private final String tag;
@@ -47,16 +37,6 @@ public class JsonEnumTest {
         @Override
         public String getValue() {
             return tag;
-        }
-
-        @Override
-        public Level parse(String value) {
-            for (Level level : values()) {
-                if (level.tag.equals(value)) {
-                    return level;
-                }
-            }
-            return null;
         }
     }
 

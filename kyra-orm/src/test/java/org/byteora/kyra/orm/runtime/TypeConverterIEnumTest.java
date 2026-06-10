@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 
 class TypeConverterIEnumTest {
 
-    enum Status implements IEnum<Status, Integer> {
+    enum Status implements IEnum<Integer> {
         ON(1), OFF(0);
 
         private final int code;
@@ -24,16 +24,6 @@ class TypeConverterIEnumTest {
         @Override
         public Integer getValue() {
             return code;
-        }
-
-        @Override
-        public Status parse(Integer value) {
-            for (Status status : values()) {
-                if (status.code == value) {
-                    return status;
-                }
-            }
-            return null;
         }
     }
 
@@ -56,7 +46,7 @@ class TypeConverterIEnumTest {
                 ResultSet.class.getClassLoader(),
                 new Class[]{ResultSet.class},
                 (proxy, method, args) -> {
-                    if ("getObject".equals(method.getName()) && args.length == 1) {
+                    if ("getObject".equals(method.getName())) {
                         return value;
                     }
                     throw new UnsupportedOperationException(method.getName());

@@ -68,8 +68,7 @@ final class Types {
 
     static Type resolve(Type type, Map<TypeVariable<?>, Type> variables) {
         if (type instanceof TypeVariable<?> typeVariable) {
-            Type resolved = lookupTypeVariable(typeVariable, variables);
-            return resolved == null ? type : resolve(resolved, variables);
+            return resolveTypeVariable(typeVariable, variables);
         }
         if (type instanceof ParameterizedType parameterizedType && parameterizedType.getRawType() instanceof Class<?> rawType) {
             Type[] arguments = parameterizedType.getActualTypeArguments();
@@ -90,6 +89,24 @@ final class Types {
                     resolveEach(wildcardType.getLowerBounds(), variables));
         }
         return type;
+    }
+
+    private static Type resolveTypeVariable(TypeVariable<?> typeVariable, Map<TypeVariable<?>, Type> variables) {
+        // Follow type-variable -> type-variable bindings (e.g. class Mid<U> extends Base<U>) until a
+        // concrete type is reached. The map can hold self-referential bindings such as
+        // T -> SimpleTypeVariable("T"), because processor-generated variables match keys only by
+        // name; bounding the walk by the number of bindings guarantees termination (you cannot follow
+        // more distinct links than there are entries without repeating one). An unresolvable variable
+        // is returned as-is so callers fall back to its bound, or to the runtime value's class.
+        Type current = typeVariable;
+        for (int remaining = variables.size(); remaining > 0 && current instanceof TypeVariable<?> variable; remaining--) {
+            Type next = lookupTypeVariable(variable, variables);
+            if (next == null || next == current) {
+                break;
+            }
+            current = next;
+        }
+        return current instanceof TypeVariable<?> ? current : resolve(current, variables);
     }
 
     private static Type[] resolveEach(Type[] types, Map<TypeVariable<?>, Type> variables) {

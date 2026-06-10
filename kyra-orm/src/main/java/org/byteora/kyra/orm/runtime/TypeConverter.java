@@ -46,7 +46,7 @@ public final class TypeConverter {
         if (value == null) {
             return null;
         }
-        if (value instanceof IEnum<?, ?>) {
+        if (value instanceof IEnum<?>) {
             return EnumSupport.toValue(value);
         }
         if (customConverters == null || customConverters.length == 0) {

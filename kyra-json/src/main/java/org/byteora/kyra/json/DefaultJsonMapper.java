@@ -70,6 +70,8 @@ final class DefaultJsonMapper implements JsonMapper {
                 throw new JsonException("Unexpected trailing JSON content");
             }
             return (T) value;
+        } catch (JsonReadException ex) {
+            throw ex.withRoot(typeName(Types.rawType(type)));
         } catch (IOException ex) {
             throw new JsonException("Failed to read JSON", ex);
         }
@@ -89,7 +91,7 @@ final class DefaultJsonMapper implements JsonMapper {
             handler.write(new WriterContext(generator, variables), value);
             return;
         }
-        if (value instanceof IEnum<?, ?> iEnum) {
+        if (value instanceof IEnum<?> iEnum) {
             writeValue(generator, iEnum.getValue(), Object.class, Map.of());
             return;
         }
@@ -234,9 +236,8 @@ final class DefaultJsonMapper implements JsonMapper {
         if (EnumSupport.isIEnum(rawType)) {
             return readIEnum(parser, rawType, variables);
         }
-        var val =readSimpleValue(parser, rawType);
-        if (val != null) {
-            return val;
+        if (isScalarType(rawType)) {
+            return readSimpleValue(parser, rawType);
         }
         if (rawType.isArray()) {
             return readArray(parser, rawType, Types.arrayElementType(resolvedType));
@@ -255,39 +256,29 @@ final class DefaultJsonMapper implements JsonMapper {
     }
 
     private Object readSimpleValue(JsonParser parser, Class<?> rawType) {
+        try {
+            return readSimpleValue0(parser, rawType);
+        } catch (JsonException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            throw coercionError(parser, rawType, ex);
+        }
+    }
+
+    private Object readSimpleValue0(JsonParser parser, Class<?> rawType) {
         if (rawType == String.class) {
+            // getValueAsString coerces numbers and booleans to their textual form (123, true).
             return parser.getValueAsString();
+        }
+        if (rawType == boolean.class || rawType == Boolean.class) {
+            return readBoolean(parser, rawType);
+        }
+        if (isNumeric(rawType)) {
+            return readNumeric(parser, rawType);
         }
         if (rawType == char.class || rawType == Character.class) {
             String value = parser.getValueAsString();
             return value == null || value.isEmpty() ? defaultValue(rawType) : value.charAt(0);
-        }
-        if (rawType == boolean.class || rawType == Boolean.class) {
-            return parser.getBooleanValue();
-        }
-        if (rawType == byte.class || rawType == Byte.class) {
-            return parser.getByteValue();
-        }
-        if (rawType == short.class || rawType == Short.class) {
-            return parser.getShortValue();
-        }
-        if (rawType == int.class || rawType == Integer.class) {
-            return parser.getIntValue();
-        }
-        if (rawType == long.class || rawType == Long.class) {
-            return parser.getLongValue();
-        }
-        if (rawType == float.class || rawType == Float.class) {
-            return parser.getFloatValue();
-        }
-        if (rawType == double.class || rawType == Double.class) {
-            return parser.getDoubleValue();
-        }
-        if (rawType == BigInteger.class) {
-            return parser.getBigIntegerValue();
-        }
-        if (rawType == BigDecimal.class) {
-            return parser.getDecimalValue();
         }
         if (rawType.isEnum()) {
             return Enum.valueOf(rawType.asSubclass(Enum.class), parser.getValueAsString());
@@ -305,8 +296,17 @@ final class DefaultJsonMapper implements JsonMapper {
         if (rawType == OffsetDateTime.class) {
             return OffsetDateTime.parse(value);
         }
+        if (rawType == ZonedDateTime.class) {
+            return ZonedDateTime.parse(value);
+        }
         if (rawType == Instant.class) {
             return Instant.parse(value);
+        }
+        if (rawType == LocalTime.class) {
+            return LocalTime.parse(value);
+        }
+        if (rawType == OffsetTime.class) {
+            return OffsetTime.parse(value);
         }
         if (rawType == Date.class) {
             try {
@@ -318,13 +318,141 @@ final class DefaultJsonMapper implements JsonMapper {
         return null;
     }
 
+    /**
+     * Coerces the current token to a boolean the way Jackson databind does: native JSON booleans
+     * pass through, numbers are true when non-zero, and the strings {@code true}/{@code false}/{@code 1}/{@code 0}
+     * (case-insensitive, trimmed) are accepted. A blank string yields the type's default.
+     */
+    private Object readBoolean(JsonParser parser, Class<?> rawType) {
+        JsonToken token = parser.currentToken();
+        if (token == JsonToken.VALUE_TRUE) {
+            return Boolean.TRUE;
+        }
+        if (token == JsonToken.VALUE_FALSE) {
+            return Boolean.FALSE;
+        }
+        if (token == JsonToken.VALUE_NUMBER_INT || token == JsonToken.VALUE_NUMBER_FLOAT) {
+            return parser.getDoubleValue() != 0d;
+        }
+        String text = parser.getValueAsString();
+        if (text != null) {
+            text = text.trim();
+            if (text.isEmpty()) {
+                return defaultValue(rawType);
+            }
+            if (text.equalsIgnoreCase("true") || text.equals("1")) {
+                return Boolean.TRUE;
+            }
+            if (text.equalsIgnoreCase("false") || text.equals("0")) {
+                return Boolean.FALSE;
+            }
+        }
+        throw new IllegalArgumentException("not a boolean: " + text);
+    }
+
+    /**
+     * Coerces the current token to the requested numeric type, accepting both JSON numbers and
+     * numeric strings (e.g. {@code "123"}). Fractional inputs are truncated toward zero when the
+     * target is integral, mirroring Jackson databind; out-of-range values fail loudly.
+     */
+    private Object readNumeric(JsonParser parser, Class<?> rawType) {
+        JsonToken token = parser.currentToken();
+        if (token == JsonToken.VALUE_NUMBER_INT) {
+            if (rawType == BigInteger.class) {
+                return parser.getBigIntegerValue();
+            }
+            if (rawType == BigDecimal.class) {
+                return parser.getDecimalValue();
+            }
+            if (rawType == double.class || rawType == Double.class) {
+                return parser.getDoubleValue();
+            }
+            if (rawType == float.class || rawType == Float.class) {
+                return parser.getFloatValue();
+            }
+            return narrowIntegral(parser.getLongValue(), rawType);
+        }
+        if (token == JsonToken.VALUE_STRING) {
+            String text = parser.getValueAsString();
+            text = text == null ? "" : text.trim();
+            if (text.isEmpty()) {
+                return defaultValue(rawType);
+            }
+            return fromBigDecimal(new BigDecimal(text), rawType);
+        }
+        // VALUE_NUMBER_FLOAT, or any other token that getDecimalValue can coerce.
+        return fromBigDecimal(parser.getDecimalValue(), rawType);
+    }
+
+    private Object fromBigDecimal(BigDecimal number, Class<?> rawType) {
+        if (rawType == BigDecimal.class) {
+            return number;
+        }
+        if (rawType == BigInteger.class) {
+            return number.toBigInteger();
+        }
+        if (rawType == double.class || rawType == Double.class) {
+            return number.doubleValue();
+        }
+        if (rawType == float.class || rawType == Float.class) {
+            return number.floatValue();
+        }
+        // toBigInteger truncates any fraction toward zero; longValueExact then guards the range.
+        return narrowIntegral(number.toBigInteger().longValueExact(), rawType);
+    }
+
+    private Object narrowIntegral(long value, Class<?> rawType) {
+        if (rawType == long.class || rawType == Long.class) {
+            return value;
+        }
+        if (rawType == int.class || rawType == Integer.class) {
+            return (int) requireRange(value, Integer.MIN_VALUE, Integer.MAX_VALUE, rawType);
+        }
+        if (rawType == short.class || rawType == Short.class) {
+            return (short) requireRange(value, Short.MIN_VALUE, Short.MAX_VALUE, rawType);
+        }
+        return (byte) requireRange(value, Byte.MIN_VALUE, Byte.MAX_VALUE, rawType);
+    }
+
+    private long requireRange(long value, long min, long max, Class<?> rawType) {
+        if (value < min || value > max) {
+            throw new IllegalArgumentException(value + " out of range for " + typeName(rawType));
+        }
+        return value;
+    }
+
+    private static boolean isNumeric(Class<?> rawType) {
+        return rawType == byte.class || rawType == Byte.class
+                || rawType == short.class || rawType == Short.class
+                || rawType == int.class || rawType == Integer.class
+                || rawType == long.class || rawType == Long.class
+                || rawType == float.class || rawType == Float.class
+                || rawType == double.class || rawType == Double.class
+                || rawType == BigInteger.class || rawType == BigDecimal.class;
+    }
+
+    private static boolean isScalarType(Class<?> rawType) {
+        return rawType == String.class
+                || rawType == char.class || rawType == Character.class
+                || rawType == boolean.class || rawType == Boolean.class
+                || isNumeric(rawType)
+                || rawType.isEnum()
+                || rawType == UUID.class
+                || rawType == LocalDate.class || rawType == LocalDateTime.class
+                || rawType == OffsetDateTime.class || rawType == ZonedDateTime.class
+                || rawType == Instant.class
+                || rawType == LocalTime.class || rawType == OffsetTime.class
+                || rawType == Date.class;
+    }
+
     @SuppressWarnings("unchecked")
     private Object readIEnum(JsonParser parser, Class<?> rawType, Map<TypeVariable<?>, Type> variables) throws IOException {
         Object encoded = readValue(parser, EnumSupport.valueType(rawType), variables);
         try {
             return EnumSupport.parse(rawType.asSubclass(Enum.class), encoded);
         } catch (IllegalArgumentException ex) {
-            throw new JsonException(ex.getMessage(), ex);
+            throw new JsonReadException(null, "", "no " + typeName(rawType)
+                    + " constant matches value " + renderValue(encoded), ex);
         }
     }
 
@@ -359,8 +487,9 @@ final class DefaultJsonMapper implements JsonMapper {
     private Object readArray(JsonParser parser, Class<?> rawType, Type elementType) throws IOException {
         expect(parser, JsonToken.START_ARRAY);
         List<Object> values = new ArrayList<>();
+        int index = 0;
         while (parser.nextToken() != JsonToken.END_ARRAY) {
-            values.add(readValue(parser, elementType, Map.of()));
+            values.add(readValueAt(parser, elementType, Map.of(), "[" + index++ + "]"));
         }
         Class<?> componentType = rawType.getComponentType();
         Object array = Array.newInstance(componentType, values.size());
@@ -373,8 +502,9 @@ final class DefaultJsonMapper implements JsonMapper {
     private Collection<?> readCollection(JsonParser parser, Class<?> rawType, Type elementType) throws IOException {
         expect(parser, JsonToken.START_ARRAY);
         Collection<Object> collection = Set.class.isAssignableFrom(rawType) ? new LinkedHashSet<>() : new ArrayList<>();
+        int index = 0;
         while (parser.nextToken() != JsonToken.END_ARRAY) {
-            collection.add(readValue(parser, elementType, Map.of()));
+            collection.add(readValueAt(parser, elementType, Map.of(), "[" + index++ + "]"));
         }
         return collection;
     }
@@ -385,7 +515,7 @@ final class DefaultJsonMapper implements JsonMapper {
         while (parser.nextToken() != JsonToken.END_OBJECT) {
             String fieldName = parser.currentName();
             parser.nextToken();
-            map.put(fieldName, readValue(parser, valueType, Map.of()));
+            map.put(fieldName, readValueAt(parser, valueType, Map.of(), "." + fieldName));
         }
         return map;
     }
@@ -405,7 +535,8 @@ final class DefaultJsonMapper implements JsonMapper {
             Integer fieldIndex = plan.plainByName().get(fieldName);
             if (fieldIndex != null) {
                 FieldInfo fieldInfo = reflector.getField(fieldIndex);
-                fieldValues[fieldIndex] = readValue(parser, fieldInfo == null ? Object.class : fieldInfo.type(), variables);
+                fieldValues[fieldIndex] = readValueAt(parser,
+                        fieldInfo == null ? Object.class : fieldInfo.type(), variables, "." + fieldName);
                 presentFields[fieldIndex] = true;
                 continue;
             }
@@ -413,14 +544,14 @@ final class DefaultJsonMapper implements JsonMapper {
             if (route != null) {
                 ChildModel model = plan.unwrapModels().get(route.parentIndex());
                 FieldInfo childField = model.reflector().getField(route.childIndex());
-                model.values()[route.childIndex()] = readValue(parser,
-                        childField == null ? Object.class : childField.type(), model.variables());
+                model.values()[route.childIndex()] = readValueAt(parser,
+                        childField == null ? Object.class : childField.type(), model.variables(), "." + fieldName);
                 model.present()[route.childIndex()] = true;
                 continue;
             }
             if (plan.anyMapIndex() >= 0 && (plan.anyMapPrefix().isEmpty() || fieldName.startsWith(plan.anyMapPrefix()))) {
                 String key = plan.anyMapPrefix().isEmpty() ? fieldName : fieldName.substring(plan.anyMapPrefix().length());
-                plan.anyMap().put(key, readValue(parser, plan.anyMapValueType(), variables));
+                plan.anyMap().put(key, readValueAt(parser, plan.anyMapValueType(), variables, "." + fieldName));
                 continue;
             }
             if (failOnUnknownProperties) {
@@ -610,8 +741,53 @@ final class DefaultJsonMapper implements JsonMapper {
 
     private void expect(JsonParser parser, JsonToken expectedToken) {
         if (parser.currentToken() != expectedToken) {
-            throw new JsonException("Expected " + expectedToken + " but got " + parser.currentToken());
+            throw new JsonReadException(null, "", "expected JSON " + expectedToken
+                    + " but found " + parser.currentToken());
         }
+    }
+
+    private Object readValueAt(JsonParser parser, Type type, Map<TypeVariable<?>, Type> variables, String segment) throws IOException {
+        try {
+            return readValue(parser, type, variables);
+        } catch (JsonReadException ex) {
+            throw ex.prepend(segment);
+        }
+    }
+
+    private JsonReadException coercionError(JsonParser parser, Class<?> rawType, Throwable cause) {
+        String detail = "expected " + typeName(rawType) + " but found JSON "
+                + parser.currentToken() + renderToken(parser);
+        return new JsonReadException(null, "", detail, cause);
+    }
+
+    private static String renderToken(JsonParser parser) {
+        String text = tokenText(parser);
+        return text == null ? "" : " (" + text + ")";
+    }
+
+    private static String tokenText(JsonParser parser) {
+        try {
+            return parser.getValueAsString();
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static String renderValue(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof CharSequence) {
+            return "\"" + value + "\"";
+        }
+        return String.valueOf(value);
+    }
+
+    private static String typeName(Class<?> rawType) {
+        if (rawType == null) {
+            return "Object";
+        }
+        return rawType.getSimpleName();
     }
 
     @SuppressWarnings("unchecked")
@@ -632,6 +808,44 @@ final class DefaultJsonMapper implements JsonMapper {
             }
         }
         return null;
+    }
+
+    /**
+     * Carries the location (root type plus a dotted/indexed path) of a failed read so the final
+     * message can point at the exact field, e.g. {@code Order.items[2].active}. Each enclosing
+     * structural reader prepends its own segment as the exception propagates outward.
+     */
+    private static final class JsonReadException extends JsonException {
+        private final String root;
+        private final String path;
+        private final String detail;
+
+        private JsonReadException(String root, String path, String detail, Throwable cause) {
+            super(render(root, path, detail), cause);
+            this.root = root;
+            this.path = path;
+            this.detail = detail;
+        }
+
+        private JsonReadException(String root, String path, String detail) {
+            this(root, path, detail, null);
+        }
+
+        private JsonReadException prepend(String segment) {
+            return new JsonReadException(root, segment + path, detail, getCause());
+        }
+
+        private JsonReadException withRoot(String newRoot) {
+            return new JsonReadException(newRoot, path, detail, getCause());
+        }
+
+        private static String render(String root, String path, String detail) {
+            String location = (root == null ? "" : root) + path;
+            if (location.isEmpty()) {
+                location = "<root>";
+            }
+            return "Failed to read JSON at " + location + ": " + detail;
+        }
     }
 
     private record ConstructorBinding(Object[] args, boolean[] constructorFields) {
