@@ -30,8 +30,6 @@ import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -55,6 +53,7 @@ final class DefaultJsonMapper implements JsonMapper {
     private static final int KIND_BIG_DECIMAL = 10;
     private static final int KIND_ENUM = 11;
     private static final int KIND_STRINGIFY = 12;
+    private static final int KIND_DATE = 13;
 
     private final JsonFactory jsonFactory;
     private final List<JsonTypeHandler<?>> handlers;
@@ -295,9 +294,14 @@ final class DefaultJsonMapper implements JsonMapper {
             generator.writeNumber(number.toString());
         } else if (rawType.isEnum()) {
             generator.writeString(((Enum<?>) value).name());
+        } else if (value instanceof Date date) {
+            // Render legacy Date as ISO-8601 instant (locale-independent, round-trippable) rather
+            // than the non-standard Date.toString() form.
+            generator.writeString(date.toInstant().toString());
         } else if (value instanceof UUID || value instanceof LocalDate || value instanceof LocalDateTime
                 || value instanceof OffsetDateTime || value instanceof Instant || value instanceof ZonedDateTime
-                || value instanceof Date || value instanceof LocalTime || value instanceof OffsetTime) {
+                || value instanceof LocalTime || value instanceof OffsetTime) {
+            // These types' toString() is already the canonical/ISO-8601 form.
             generator.writeString(value.toString());
         } else {
             return false;
@@ -506,6 +510,7 @@ final class DefaultJsonMapper implements JsonMapper {
             case KIND_BIG_INTEGER -> generator.writeNumber((BigInteger) value);
             case KIND_BIG_DECIMAL -> generator.writeNumber((BigDecimal) value);
             case KIND_STRINGIFY -> generator.writeString(value.toString());
+            case KIND_DATE -> generator.writeString(((Date) value).toInstant().toString());
             default -> throw new IllegalStateException("Unsupported scalar kind: " + kind);
         }
     }
@@ -619,11 +624,12 @@ final class DefaultJsonMapper implements JsonMapper {
             return OffsetTime.parse(value);
         }
         if (rawType == Date.class) {
-            try {
-                return SimpleDateFormat.getDateInstance().parse(value);
-            } catch (ParseException e) {
-                throw new JsonException("Invalid date format: " + value, e);
+            // Accept an epoch-millis number or an ISO-8601 instant string; mirrors the ISO write form
+            // and tolerates the numeric-timestamp form other libraries emit.
+            if (parser.currentToken() == JsonToken.VALUE_NUMBER_INT) {
+                return new Date(parser.getLongValue());
             }
+            return Date.from(Instant.parse(value));
         }
         return null;
     }
@@ -1498,12 +1504,14 @@ final class DefaultJsonMapper implements JsonMapper {
         if (rawType.isEnum()) {
             return EnumSupport.isIEnum(rawType) ? KIND_DELEGATE : KIND_ENUM;
         }
+        if (rawType == Date.class) {
+            return KIND_DATE;
+        }
         if (rawType == UUID.class
                 || rawType == LocalDate.class || rawType == LocalDateTime.class
                 || rawType == OffsetDateTime.class || rawType == ZonedDateTime.class
                 || rawType == Instant.class
-                || rawType == LocalTime.class || rawType == OffsetTime.class
-                || rawType == Date.class) {
+                || rawType == LocalTime.class || rawType == OffsetTime.class) {
             return KIND_STRINGIFY;
         }
         return KIND_DELEGATE;
