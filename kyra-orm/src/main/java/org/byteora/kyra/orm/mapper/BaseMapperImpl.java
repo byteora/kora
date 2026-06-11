@@ -15,6 +15,7 @@ import org.byteora.kyra.orm.query.Expressions;
 import org.byteora.kyra.orm.runtime.AbstractMapper;
 import org.byteora.kyra.core.runtime.Reflector;
 import org.byteora.kyra.core.runtime.ReflectorRegistry;
+import org.byteora.kyra.orm.runtime.DbType;
 import org.byteora.kyra.orm.runtime.DefaultIdGenerator;
 import org.byteora.kyra.orm.runtime.SqlExecutionContext;
 import org.byteora.kyra.orm.runtime.SqlExecutor;
@@ -29,8 +30,17 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class BaseMapperImpl<T> extends AbstractMapper<T> implements BaseMapper<T> {
+    /**
+     * Caches the rendered {@code insert} SQL per (entity type, dialect, ordered column set). The
+     * column set is the only input to the rendered statement (placeholders are positional), so for a
+     * batch of same-shaped entities the SQL is rendered once and reused. Bounded by the number of
+     * distinct non-null field combinations per entity type.
+     */
+    private static final Map<InsertSqlKey, String> INSERT_SQL_CACHE = new ConcurrentHashMap<>();
+
     protected final EntityTable<T> entityTable;
 
     public BaseMapperImpl(SqlExecutor sqlExecutor, Class<T> entityClass) {
@@ -262,8 +272,12 @@ public class BaseMapperImpl<T> extends AbstractMapper<T> implements BaseMapper<T
         if (columns.isEmpty()) {
             throw new SqlExecutorException("Insert requires at least one non-null field: " + entityClass.getName());
         }
-        SqlRequest request = sqlExecutor.getSqlGenerator().renderInsert(entityTable, columns, args, sqlExecutor.getDbType());
-        return new InsertSpec(request.sql(), request.args(), assignGeneratedId);
+        DbType dbType = sqlExecutor.getDbType();
+        String sql = INSERT_SQL_CACHE.computeIfAbsent(
+                new InsertSqlKey(entityClass, dbType, columns),
+                key -> sqlExecutor.getSqlGenerator().renderInsert(entityTable, key.columns(), args, dbType).sql()
+        );
+        return new InsertSpec(sql, args.toArray(), assignGeneratedId);
     }
 
     private boolean appendInsertId(T entity, Reflector<T> reflector, int idFieldIndex, List<String> columns, List<Object> args) {
@@ -342,5 +356,13 @@ public class BaseMapperImpl<T> extends AbstractMapper<T> implements BaseMapper<T
     }
 
     private record UpdateByIdSpec(String sql, Object[] args) {
+    }
+
+    /**
+     * Cache key for rendered insert SQL. {@code columns} participates in equality by value (an
+     * ordered {@link List}); it is built fresh per call and never mutated afterwards, so it is safe
+     * to retain as a key without defensive copying.
+     */
+    private record InsertSqlKey(Class<?> entityType, DbType dbType, List<String> columns) {
     }
 }
